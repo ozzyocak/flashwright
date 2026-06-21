@@ -129,6 +129,8 @@ impl Browser {
 
     pub async fn close(&mut self) {
         let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+        let _ = tokio::fs::remove_dir_all(&self.user_data_dir).await;
     }
 }
 

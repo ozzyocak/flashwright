@@ -2,15 +2,11 @@
 
 A fast Chromium automation CLI written in Rust.
 
-Talks directly to Chrome via the Chrome DevTools Protocol over a hand-rolled WebSocket client. No Node.js, no heavy dependencies, no browser driver. Just a single Rust binary.
+![flashwright vs Playwright](flashwright-vs-playwright.png)
 
-## Install
+Talks directly to Chrome via the Chrome DevTools Protocol over a hand-rolled WebSocket client. No Node.js, no heavy dependencies, no browser driver. Just a single 850KB binary.
 
-```sh
-cargo install --path .
-```
-
-Or build from source:
+## Build
 
 ```sh
 git clone https://github.com/ozzyocak/flashwright.git
@@ -18,18 +14,25 @@ cd flashwright
 cargo build --release
 ```
 
-The binary will be at `target/release/flashwright`.
+The binary is at `target/release/flashwright`.
 
-## Usage
+Or install directly:
 
 ```sh
+cargo install --path .
+```
+
+## Run
+
+```sh
+# single commands
 flashwright navigate https://example.com
 flashwright eval "document.title"
 flashwright screenshot out.png
 flashwright click "button#submit"
 flashwright type "input[name=email]" "hello@example.com"
-flashwright content
 flashwright title
+flashwright content
 ```
 
 ### Script mode
@@ -51,13 +54,25 @@ screenshot out.png
 
 ### Daemon mode
 
-flashwright keeps Chrome alive between commands using a background daemon. The first command auto-starts it. Subsequent commands reuse the same browser instance with near-zero overhead.
+flashwright keeps Chrome alive between commands using a background daemon. The first command auto-starts it. Subsequent commands reuse the same browser with near-zero overhead.
 
 ```sh
 flashwright eval "1+1"          # first call: starts daemon + Chrome (~1s)
-flashwright eval "2+2"          # warm: ~0.07s
+flashwright eval "2+2"          # warm: ~0.005s
 flashwright navigate https://example.com  # warm: ~0.1s
 flashwright stop                # stop daemon
+```
+
+### Pipe mode
+
+Stream JSONL commands over a single connection:
+
+```sh
+printf '%s\n' \
+  '{"cmd":"navigate","args":["https://example.com"]}' \
+  '{"cmd":"eval","args":["document.title"]}' \
+  '{"cmd":"title"}' \
+  | flashwright pipe
 ```
 
 ### Options
@@ -83,13 +98,14 @@ flashwright stop                # stop daemon
 | `title` | Print page title |
 | `content` | Print page HTML |
 | `script <file>` | Run script file |
+| `pipe` | Stream JSONL commands over one connection |
 | `serve` | Start daemon manually |
 | `stop` | Stop daemon |
 
 ## Requirements
 
 - A Chromium-based browser (Chrome, Chromium, Edge, Brave)
-- Rust 1.70+ (for building)
+- Rust 1.70+
 
 ## License
 

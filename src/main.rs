@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use base64::Engine;
 use serde_json::{json, Value};
 use session::{Page, Session};
+use std::io::BufRead as StdBufRead;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -76,21 +77,27 @@ COMMANDS:
   title                    Print page title
   content                  Print page HTML
   script <file>            Run script file
+  pipe                     Read JSONL commands from stdin
   stop                     Stop the daemon
 
 The first command auto-starts the daemon. Subsequent commands reuse it."
     );
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = parse_args()?;
 
     match args.command.as_str() {
         "serve" => run_daemon(args).await,
+        "pipe" => run_pipe(&args).await,
         "stop" => {
             let mut sock = UnixStream::connect(SOCK_PATH).await?;
             write_json_line(&mut sock, &json!({"cmd": "stop"})).await?;
+            let resp = read_json_line(&mut sock).await?;
+            if let Some(err) = resp.get("error") {
+                bail!("{}", err);
+            }
             println!("daemon stopped");
             Ok(())
         }
@@ -98,13 +105,9 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn daemon_running() -> bool {
-    UnixStream::connect(SOCK_PATH).await.is_ok()
-}
-
-async fn ensure_daemon(args: &Args) -> Result<()> {
-    if daemon_running().await {
-        return Ok(());
+async fn connect_daemon(args: &Args) -> Result<UnixStream> {
+    if let Ok(sock) = UnixStream::connect(SOCK_PATH).await {
+        return Ok(sock);
     }
 
     let exe = std::env::current_exe()?;
@@ -116,13 +119,15 @@ async fn ensure_daemon(args: &Args) -> Result<()> {
     if let Some(ref c) = args.chrome {
         cmd.arg("--chrome").arg(c);
     }
+    if let Some((w, h)) = args.viewport {
+        cmd.arg("--viewport").arg(format!("{}x{}", w, h));
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
     }
 
@@ -130,8 +135,8 @@ async fn ensure_daemon(args: &Args) -> Result<()> {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if daemon_running().await {
-            return Ok(());
+        if let Ok(sock) = UnixStream::connect(SOCK_PATH).await {
+            return Ok(sock);
         }
         if tokio::time::Instant::now() > deadline {
             bail!("daemon failed to start");
@@ -140,9 +145,56 @@ async fn ensure_daemon(args: &Args) -> Result<()> {
     }
 }
 
+async fn run_pipe(args: &Args) -> Result<()> {
+    let mut sock = connect_daemon(args).await?;
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req = match prepare_pipe_request(&line, args.timeout) {
+            Ok(req) => req,
+            Err(err) => {
+                write_pipe_response(&mut stdout, &json!({"error": err.to_string()}))?;
+                continue;
+            }
+        };
+
+        write_json_line(&mut sock, &req).await?;
+        let resp = read_json_line(&mut sock).await?;
+        write_pipe_response(&mut stdout, &resp)?;
+    }
+
+    Ok(())
+}
+
+fn prepare_pipe_request(line: &str, default_timeout: u64) -> Result<Value> {
+    let mut req: Value = serde_json::from_str(line)?;
+    let obj = req
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("request must be a JSON object"))?;
+    match obj.get("cmd") {
+        Some(Value::String(cmd)) if !cmd.is_empty() => {}
+        _ => bail!("request must include a non-empty string cmd"),
+    }
+    obj.entry("timeout".to_string())
+        .or_insert_with(|| json!(default_timeout));
+    Ok(req)
+}
+
+fn write_pipe_response(out: &mut impl std::io::Write, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *out, value)?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
+}
+
 async fn run_client(args: &Args) -> Result<()> {
-    ensure_daemon(args).await?;
-    let mut sock = UnixStream::connect(SOCK_PATH).await?;
+    let mut sock = connect_daemon(args).await?;
 
     if args.command == "script" {
         let file = args.cmd_args.first().cloned().unwrap_or_default();
@@ -213,118 +265,140 @@ async fn run_daemon(args: Args) -> Result<()> {
     let listener = UnixListener::bind(SOCK_PATH)?;
     let session = std::sync::Arc::new(session);
     let page = std::sync::Arc::new(page);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     loop {
-        let (sock, _) = match listener.accept().await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let session = session.clone();
-        let page = page.clone();
-        tokio::spawn(async move {
-            handle_client(sock, session, page).await;
-        });
+        tokio::select! {
+            _ = shutdown_rx.recv() => break,
+            accepted = listener.accept() => {
+                let (sock, _) = match accepted {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let session = session.clone();
+                let page = page.clone();
+                let shutdown_tx = shutdown_tx.clone();
+                tokio::spawn(async move {
+                    handle_client(sock, session, page, shutdown_tx).await;
+                });
+            }
+        }
     }
+
+    drop(listener);
+    let _ = std::fs::remove_file(SOCK_PATH);
+    browser.close().await;
+    Ok(())
 }
 
-async fn handle_client(mut sock: UnixStream, session: std::sync::Arc<Session>, page: std::sync::Arc<Page>) {
-    let req = match read_json_line(&mut sock).await {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+async fn handle_client(
+    sock: UnixStream,
+    session: std::sync::Arc<Session>,
+    page: std::sync::Arc<Page>,
+    shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let mut sock = BufReader::new(sock);
 
-    let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
-    let timeout = req.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
-    let args_arr = req.get("args").and_then(|v| v.as_array());
+    loop {
+        let req = match read_json_line_buffered(&mut sock).await {
+            Ok(Some(v)) => v,
+            Ok(None) | Err(_) => return,
+        };
 
-    let result: Result<Value> = async {
-        match cmd {
-            "stop" => {
-                let _ = std::fs::remove_file(SOCK_PATH);
-                write_json_line(&mut sock, &json!({"ok": true})).await.ok();
-                std::process::exit(0);
-            }
-            "navigate" => {
-                let url = get_arg(args_arr, 0);
-                page.navigate(&session, &url).await?;
-                Ok(json!({"text": format!("navigated: {}", url)}))
-            }
-            "eval" => {
-                let expr = args_arr
-                    .map(|a| a.iter().map(|v| v.as_str().unwrap_or("")).collect::<Vec<_>>().join(" "))
-                    .unwrap_or_default();
-                let v = page.eval(&session, &expr).await?;
-                Ok(json!({"text": serde_json::to_string(&v)?}))
-            }
-            "click" => {
-                let sel = get_arg(args_arr, 0);
-                page.click(&session, &sel).await?;
-                Ok(json!({"text": format!("clicked: {}", sel)}))
-            }
-            "type" => {
-                let sel = get_arg(args_arr, 0);
-                let text = get_arg(args_arr, 1);
-                page.type_text(&session, &sel, &text).await?;
-                Ok(json!({"text": format!("typed into: {}", sel)}))
-            }
-            "screenshot" => {
-                let out = args_arr.and_then(|a| a.get(0).and_then(|v| v.as_str())).map(|s| s.to_string());
-                let format = args_arr.and_then(|a| a.get(1).and_then(|v| v.as_str())).unwrap_or("png").to_string();
-                let bytes = page.screenshot(&session, &format).await?;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                Ok(json!({"data_b64": b64, "out": out.unwrap_or_default(), "kind": "screenshot"}))
-            }
-            "pdf" => {
-                let out = args_arr.and_then(|a| a.get(0).and_then(|v| v.as_str())).map(|s| s.to_string());
-                let bytes = page.pdf(&session).await?;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                Ok(json!({"data_b64": b64, "out": out.unwrap_or_default(), "kind": "page"}))
-            }
-            "wait" => {
-                let sel = get_arg(args_arr, 0);
-                page.wait_selector(&session, &sel, timeout).await?;
-                Ok(json!({"text": format!("ready: {}", sel)}))
-            }
-            "title" => {
-                let v = page.eval(&session, "document.title").await?;
-                Ok(json!({"text": v.as_str().unwrap_or("")}))
-            }
-            "content" => {
-                let v = page.eval(&session, "document.documentElement.outerHTML").await?;
-                Ok(json!({"text": v.as_str().unwrap_or("")}))
-            }
-            "viewport" => {
-                let vp = req.get("viewport").and_then(|v| v.as_array());
-                if let Some(vp) = vp {
-                    let w = vp[0].as_u64().unwrap_or(1280) as u32;
-                    let h = vp[1].as_u64().unwrap_or(720) as u32;
-                    page.set_viewport(&session, w, h).await?;
-                    Ok(json!({"text": format!("viewport: {}x{}", w, h)}))
-                } else {
-                    bail!("no viewport specified");
+        let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+        let timeout = req.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+        let args_arr = req.get("args").and_then(|v| v.as_array());
+
+        if cmd == "stop" {
+            let _ = write_json_line(sock.get_mut(), &json!({"ok": true})).await;
+            let _ = shutdown_tx.send(());
+            return;
+        }
+
+        let result: Result<Value> = async {
+            match cmd {
+                "navigate" => {
+                    let url = get_arg(args_arr, 0);
+                    page.navigate(&session, &url).await?;
+                    Ok(json!({"text": format!("navigated: {}", url)}))
                 }
-            }
-            "script" => {
-                let lines = req.get("lines").and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let mut outputs = Vec::new();
-                for line in &lines {
-                    let action = parse_script_line(line)?;
-                    let out = run_action(&session, &page, action, timeout).await?;
-                    if let Some(o) = out {
-                        outputs.push(o);
+                "eval" => {
+                    let expr = args_arr
+                        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("")).collect::<Vec<_>>().join(" "))
+                        .unwrap_or_default();
+                    let v = page.eval(&session, &expr).await?;
+                    Ok(json!({"text": serde_json::to_string(&v)?}))
+                }
+                "click" => {
+                    let sel = get_arg(args_arr, 0);
+                    page.click(&session, &sel).await?;
+                    Ok(json!({"text": format!("clicked: {}", sel)}))
+                }
+                "type" => {
+                    let sel = get_arg(args_arr, 0);
+                    let text = get_arg(args_arr, 1);
+                    page.type_text(&session, &sel, &text).await?;
+                    Ok(json!({"text": format!("typed into: {}", sel)}))
+                }
+                "screenshot" => {
+                    let out = args_arr.and_then(|a| a.get(0).and_then(|v| v.as_str())).map(|s| s.to_string());
+                    let format = args_arr.and_then(|a| a.get(1).and_then(|v| v.as_str())).unwrap_or("png").to_string();
+                    let bytes = page.screenshot(&session, &format).await?;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    Ok(json!({"data_b64": b64, "out": out.unwrap_or_default(), "kind": "screenshot"}))
+                }
+                "pdf" => {
+                    let out = args_arr.and_then(|a| a.get(0).and_then(|v| v.as_str())).map(|s| s.to_string());
+                    let bytes = page.pdf(&session).await?;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    Ok(json!({"data_b64": b64, "out": out.unwrap_or_default(), "kind": "page"}))
+                }
+                "wait" => {
+                    let sel = get_arg(args_arr, 0);
+                    page.wait_selector(&session, &sel, timeout).await?;
+                    Ok(json!({"text": format!("ready: {}", sel)}))
+                }
+                "title" => {
+                    let v = page.eval(&session, "document.title").await?;
+                    Ok(json!({"text": v.as_str().unwrap_or("")}))
+                }
+                "content" => {
+                    let v = page.eval(&session, "document.documentElement.outerHTML").await?;
+                    Ok(json!({"text": v.as_str().unwrap_or("")}))
+                }
+                "viewport" => {
+                    let vp = req.get("viewport").and_then(|v| v.as_array());
+                    if let Some(vp) = vp {
+                        let w = vp[0].as_u64().unwrap_or(1280) as u32;
+                        let h = vp[1].as_u64().unwrap_or(720) as u32;
+                        page.set_viewport(&session, w, h).await?;
+                        Ok(json!({"text": format!("viewport: {}x{}", w, h)}))
+                    } else {
+                        bail!("no viewport specified");
                     }
                 }
-                Ok(json!({"outputs": outputs}))
+                "script" => {
+                    let lines = req.get("lines").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let mut outputs = Vec::new();
+                    for line in &lines {
+                        let action = parse_script_line(line)?;
+                        let out = run_action(&session, &page, action, timeout).await?;
+                        if let Some(o) = out {
+                            outputs.push(o);
+                        }
+                    }
+                    Ok(json!({"outputs": outputs}))
+                }
+                other => bail!("unknown command: {}", other),
             }
-            other => bail!("unknown command: {}", other),
-        }
-    }.await;
+        }.await;
 
-    match result {
-        Ok(v) => { let _ = write_json_line(&mut sock, &v).await; }
-        Err(e) => { let _ = write_json_line(&mut sock, &json!({"error": e.to_string()})).await; }
+        match result {
+            Ok(v) => { let _ = write_json_line(sock.get_mut(), &v).await; }
+            Err(e) => { let _ = write_json_line(sock.get_mut(), &json!({"error": e.to_string()})).await; }
+        }
     }
 }
 
@@ -367,6 +441,14 @@ async fn read_json_line(sock: &mut UnixStream) -> Result<Value> {
     let mut buf = String::new();
     reader.read_line(&mut buf).await?;
     Ok(serde_json::from_str(&buf)?)
+}
+
+async fn read_json_line_buffered(reader: &mut BufReader<UnixStream>) -> Result<Option<Value>> {
+    let mut buf = String::new();
+    if reader.read_line(&mut buf).await? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&buf)?))
 }
 
 fn write_bytes(out: &Option<String>, bytes: &[u8], kind: &str) -> Result<()> {
@@ -466,4 +548,28 @@ fn tokenize(line: &str) -> Result<Vec<String>> {
     }
     if !cur.is_empty() { out.push(cur); }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_request_adds_default_timeout() {
+        let req = prepare_pipe_request(r#"{"cmd":"eval","args":["1+1"]}"#, 1234).unwrap();
+        assert_eq!(req["timeout"], json!(1234));
+        assert_eq!(req["args"], json!(["1+1"]));
+    }
+
+    #[test]
+    fn pipe_request_preserves_explicit_timeout() {
+        let req = prepare_pipe_request(r#"{"cmd":"wait","timeout":50}"#, 1234).unwrap();
+        assert_eq!(req["timeout"], json!(50));
+    }
+
+    #[test]
+    fn pipe_request_requires_command() {
+        assert!(prepare_pipe_request(r#"{"args":[]}"#, 1234).is_err());
+        assert!(prepare_pipe_request("[]", 1234).is_err());
+    }
 }
